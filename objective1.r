@@ -145,30 +145,26 @@ cat(
 # ------------------------------------------------------------------------------
 # 5. BOOTSTRAP ESTIMATION FUNCTION (ROBUST VERSION)
 # ------------------------------------------------------------------------------
-# این بخش را بین مرحله ۴ (Define Study Population) و مرحله ۶ (Table 1 Helper) قرار دهید
-
 calculate_stats_with_bootstrap <- function(df, group_var, target_var,
                                            bsw_cols, weight_var = "WTS_M") {
-  # 1. Get valid groups (removing NA categories from the loop list)
+  # 1. Get valid groups (removing NA categories explicitly)
   groups <- unique(na.omit(df[[group_var]]))
   out <- list()
 
   for (g in groups) {
-    # 2. ROBUST SUBSETTING: Use which() to ignore NAs.
-    # This ensures we don't get NA rows when the grouping variable has NAs
+    # 2. ROBUST SUBSETTING: Use which() to ignore NAs safely
     gd <- df[which(df[[group_var]] == g), ]
-
+    
     if (nrow(gd) == 0) next
 
     # Main estimate
-    theta <- sum(gd[[weight_var]] * gd[[target_var]]) /
-      sum(gd[[weight_var]]) * 100
+    theta <- sum(gd[[weight_var]] * gd[[target_var]]) / sum(gd[[weight_var]]) * 100
 
     # Bootstrap replicates
     W <- as.matrix(gd[, bsw_cols])
     y <- gd[[target_var]]
 
-    # Matrix multiplication for speed
+    # Matrix multiplication
     theta_b <- (t(W) %*% y) / colSums(W) * 100
     var_b <- mean((theta_b - theta)^2)
     se <- sqrt(var_b)
@@ -186,22 +182,19 @@ calculate_stats_with_bootstrap <- function(df, group_var, target_var,
   bind_rows(out)
 }
 
+
 calc_col_pct <- function(df, target_col) {
-  # Create a dummy variable for each level of the target column
   levels <- unique(na.omit(df[[target_col]]))
   res_list <- list()
 
   for (l in levels) {
-    # --- START OF FIX ---
-    # Use dplyr::if_else which handles NA values gracefully via the `missing` argument.
-    # This ensures NAs in the target column become 0 in the flag, not NA.
+    # FIX: missing = 0 ensures NA rows are counted in denominator but not numerator
     df$temp_flag <- if_else(df[[target_col]] == l, 1, 0, missing = 0)
-    # --- END OF FIX ---
-
-    # Use existing function with a dummy group
+    
     df$Total_Group <- "Total Population"
-
+    
     res <- calculate_stats_with_bootstrap(df, "Total_Group", "temp_flag", bsw_cols)
+    
     res$Characteristic <- paste(target_col, ":", l)
     res_list[[l]] <- res %>% select(Characteristic, Estimate_percent, CI_lower, CI_upper)
   }
@@ -318,39 +311,21 @@ print_table(
 )
 
 # ---- Part E: Table 1 - Study Sample Description (Estimating Population %) ----
-# Note: To create Table 1 (Descriptive), we treat the demographic variable
-# as the outcome to see its distribution in the population.
+
 
 cat("\n--- TABLE 1 GENERATION (Descriptive Characteristics) ---\n")
 
-# Helper to calculate column percentage
-calc_col_pct <- function(df, target_col) {
-  levels <- unique(na.omit(df[[target_col]]))
-  res_list <- list()
 
-  for (l in levels) {
-    # تغییر مهم: افزودن missing = 0
-    df$temp_flag <- if_else(df[[target_col]] == l, 1, 0, missing = 0)
 
-    df$Total_Group <- "Total Population"
-
-    # فراخوانی تابع اصلاح شده بالا
-    res <- calculate_stats_with_bootstrap(df, "Total_Group", "temp_flag", bsw_cols)
-
-    res$Characteristic <- paste(target_col, ":", l)
-    res_list[[l]] <- res %>% select(Characteristic, Estimate_percent, CI_lower, CI_upper)
-  }
-  bind_rows(res_list)
-}
 
 # Run for key demographics
 t1_age <- calc_col_pct(analysis_data, "Age_Group")
 t1_sex <- calc_col_pct(analysis_data, "Sex_Label")
 t1_mob <- calc_col_pct(analysis_data, "Mobility_Label")
-t1_cog <- calc_col_pct(analysis_data, "Cognition_Label") # <-- Add this line
+t1_cog <- calc_col_pct(analysis_data, "Cognition_Label") 
 
 # Combine all characteristics into the final table
-table1_final <- bind_rows(t1_age, t1_sex, t1_mob, t1_cog) # <-- And add it here
+table1_final <- bind_rows(t1_age, t1_sex, t1_mob, t1_cog) 
 
 print_table(
   table1_final,

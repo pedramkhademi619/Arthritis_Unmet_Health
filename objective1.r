@@ -42,6 +42,7 @@ cat("\n[2/6] Loading bootstrap weights (fixed-width format)\n")
 cat("------------------------------------------------------------\n")
 
 bsw_widths <- c(20, 7, rep(7, 1000))
+
 bsw_names <- c("ADM_RNO", "FWGT_BSW", paste0("BSW", 1:1000))
 
 bsw_data <- read_fwf(
@@ -57,52 +58,90 @@ cat("Rows:", format(nrow(bsw_data), big.mark = ","), "\n")
 # ------------------------------------------------------------------------------
 # 3. MERGE DATA
 # ------------------------------------------------------------------------------
-cat("\n[3/6] Merging survey data with bootstrap weights\n")
-cat("------------------------------------------------------------\n")
+  cat("\n[3/6] Merging survey data with bootstrap weights\n")
+  cat("------------------------------------------------------------\n")
 
-main_data <- main_data %>% mutate(ADM_RNO = as.numeric(ADM_RNO))
-bsw_data <- bsw_data %>% mutate(ADM_RNO = as.numeric(ADM_RNO))
+  main_data <- main_data %>% mutate(ADM_RNO = as.numeric(ADM_RNO))
+  bsw_data <- bsw_data %>% mutate(ADM_RNO = as.numeric(ADM_RNO))
 
-data <- inner_join(main_data, bsw_data, by = "ADM_RNO")
+  data <- inner_join(main_data, bsw_data, by = "ADM_RNO")
 
-cat("Merge complete\n")
-cat("Combined records:", format(nrow(data), big.mark = ","), "\n")
+  cat("Merge complete\n")
+  cat("Combined records:", format(nrow(data), big.mark = ","), "\n")
 
-rm(main_data, bsw_data)
-gc(verbose = FALSE)
+  rm(main_data, bsw_data)
+  gc(verbose = FALSE)
 
 # ------------------------------------------------------------------------------
-# 4. DEFINE STUDY POPULATION
+# 4. DEFINE STUDY POPULATION & REPORTING (UPDATED)
 # ------------------------------------------------------------------------------
 cat("\n[4/6] Defining analytical study population\n")
 cat("------------------------------------------------------------\n")
 
-bsw_cols <- paste0("BSW", 1:1000)
+# --- A. Flow Diagram Numbers (Calculations) ---
 
+# Step 0: Total Records
+n_total <- nrow(data)
+cat("Step 0: Total Records in File:        ", format(n_total, big.mark = ","), "\n")
+
+# Step 1: Filter Age (65+)
+# Note: DHHGAGE >= 13 means 65 years and older
+data_step1 <- data %>% filter(DHHGAGE >= 13)
+n_step1 <- nrow(data_step1)
+cat("Step 1: After Age Filter (65+):       ", format(n_step1, big.mark = ","), 
+    "(Excluded:", format(n_total - n_step1, big.mark = ","), ")\n")
+
+# Step 2: Filter Arthritis (CCC_050 == 1)
+data_step2 <- data_step1 %>% filter(CCC_050 == 1)
+n_step2 <- nrow(data_step2)
+cat("Step 2: After Arthritis Filter:       ", format(n_step2, big.mark = ","), 
+    "(Excluded:", format(n_step1 - n_step2, big.mark = ","), ")\n")
+
+# Step 3: Filter Valid Provinces
+# Determine which provinces have data for Unmet Needs (UCN)
 valid_provinces <- data %>%
   group_by(GEO_PRV) %>%
   summarise(Has_Data = mean(UCN_005 %in% c(1, 2), na.rm = TRUE) > 0) %>%
   filter(Has_Data) %>%
   pull(GEO_PRV)
 
-cat(
-  "Participating provinces:",
-  paste(valid_provinces, collapse = ", "), "\n"
-)
+cat("Participating Provinces Codes:", paste(valid_provinces, collapse = ", "), "\n")
 
-analysis_data <- data %>%
-  filter(DHHGAGE >= 13) %>% # Age 65+
-  filter(CCC_050 == 1) %>% # Arthritis
-  filter(GEO_PRV %in% valid_provinces) %>%
+# Apply Province Filter
+analysis_data_raw <- data_step2 %>% filter(GEO_PRV %in% valid_provinces)
+n_final <- nrow(analysis_data_raw)
+
+cat("Step 3: After Province Filter:        ", format(n_final, big.mark = ","), 
+    "(Excluded:", format(n_step2 - n_final, big.mark = ","), ")\n")
+
+cat("\n*** FINAL STUDY POPULATION SIZE:", format(n_final, big.mark = ","), "***\n")
+
+
+# --- B. Raw Counts Report (Requested by Supervisor) ---
+cat("\n--- Raw Response Counts for Functional Limitations (Before Grouping) ---\n")
+# Codes: 1=No Difficulty, 2=Some, 3=A lot, 4=Unable, 6=Skip, 9=Not Stated
+wdm_vars_check <- c("WDM_005", "WDM_010", "WDM_015", "WDM_020", "WDM_025", "WDM_030")
+wdm_names_check <- c("Vision", "Hearing", "Mobility", "Cognition", "SelfCare", "Comm")
+
+for(i in seq_along(wdm_vars_check)) {
+  v <- wdm_vars_check[i]
+  n <- wdm_names_check[i]
+  cat("\nVariable:", n, "(", v, ")\n")
+  print(table(analysis_data_raw[[v]], useNA = "always"))
+}
+cat("------------------------------------------------------------\n")
+
+
+# --- C. Create Derived Variables (Final Dataset) ---
+
+analysis_data <- analysis_data_raw %>%
   mutate(
     # --- Core variables ---
     Has_Unmet_Need = if_else(UCN_005 == 1, 1, 0, missing = 0),
     Age_Group = if_else(DHHGAGE == 16, "80+", "65-79"),
     Sex_Label = if_else(DHH_SEX == 1, "Male", "Female"),
 
-    # --- START OF NEW VARIABLES ---
-
-    # 1. Province Labels
+    # --- Province Labels ---
     Province_Label = case_when(
       GEO_PRV == 10 ~ "NL",
       GEO_PRV == 11 ~ "PE",
@@ -117,29 +156,54 @@ analysis_data <- data %>%
       TRUE ~ "Territories/Other"
     ),
 
-    # 2. Functional Limitations (WDM Variables)
+    # --- Functional Limitations (WDM Variables) ---
+    # Logic: 1 = No difficulty | 2,3,4 = Difficulty
 
-    # Mobility limitation
+    # 1. Vision
+    Vision_Label = case_when(
+      WDM_005 == 1 ~ "No Vision Limit",
+      WDM_005 %in% c(2, 3, 4) ~ "Has Vision Limit",
+      TRUE ~ NA_character_
+    ),
+
+    # 2. Hearing
+    Hearing_Label = case_when(
+      WDM_010 == 1 ~ "No Hearing Limit",
+      WDM_010 %in% c(2, 3, 4) ~ "Has Hearing Limit",
+      TRUE ~ NA_character_
+    ),
+
+    # 3. Mobility
     Mobility_Label = case_when(
       WDM_015 == 1 ~ "No Mobility Limit",
       WDM_015 %in% c(2, 3, 4) ~ "Has Mobility Limit",
       TRUE ~ NA_character_
     ),
 
-    # Cognitive limitation
+    # 4. Cognition
     Cognition_Label = case_when(
       WDM_020 == 1 ~ "No Cognition Limit",
       WDM_020 %in% c(2, 3, 4) ~ "Has Cognition Limit",
       TRUE ~ NA_character_
+    ),
+
+    # 5. Self-care
+    SelfCare_Label = case_when(
+      WDM_025 == 1 ~ "No SelfCare Limit",
+      WDM_025 %in% c(2, 3, 4) ~ "Has SelfCare Limit",
+      TRUE ~ NA_character_
+    ),
+
+    # 6. Communication
+    Communication_Label = case_when(
+      WDM_030 == 1 ~ "No Comm Limit",
+      WDM_030 %in% c(2, 3, 4) ~ "Has Comm Limit",
+      TRUE ~ NA_character_
     )
-
-    # --- END OF NEW VARIABLES ---
   )
+bsw_cols <- paste0("BSW", 1:1000)
 
-cat(
-  "Final study population size:",
-  format(nrow(analysis_data), big.mark = ","), "\n"
-)
+cat("Variable engineering complete. Ready for analysis.\n")
 
 
 # ------------------------------------------------------------------------------
@@ -292,45 +356,69 @@ print_table(
 
 # ---- Part D: Prevalence by Functional Limitations ----------------------------
 
-# 1. Mobility
+# 1. Vision
+see_tab <- calculate_stats_with_bootstrap(
+  analysis_data, "Vision_Label", "Has_Unmet_Need", bsw_cols
+)
+print_table(see_tab, "Table 5. Prevalence by Vision Limitation")
+
+# 2. Hearing
+hear_tab <- calculate_stats_with_bootstrap(
+  analysis_data, "Hearing_Label", "Has_Unmet_Need", bsw_cols
+)
+print_table(hear_tab, "Table 6. Prevalence by Hearing Limitation")
+
+# 3. Mobility
 mob_tab <- calculate_stats_with_bootstrap(
   analysis_data, "Mobility_Label", "Has_Unmet_Need", bsw_cols
 )
-print_table(
-  mob_tab,
-  "Table 5. Prevalence by Mobility Limitation (Walking/Climbing)"
-)
+print_table(mob_tab, "Table 7. Prevalence by Mobility Limitation")
 
-# 2. Cognition
+# 4. Cognition
 cog_tab <- calculate_stats_with_bootstrap(
   analysis_data, "Cognition_Label", "Has_Unmet_Need", bsw_cols
 )
-print_table(
-  cog_tab,
-  "Table 6. Prevalence by Cognition Limitation (Memory/Concentration)"
+print_table(cog_tab, "Table 8. Prevalence by Cognition Limitation")
+
+# 5. Self-Care
+care_tab <- calculate_stats_with_bootstrap(
+  analysis_data, "SelfCare_Label", "Has_Unmet_Need", bsw_cols
 )
+print_table(care_tab, "Table 9. Prevalence by Self-Care Limitation")
+
+# 6. Communication
+comm_tab <- calculate_stats_with_bootstrap(
+  analysis_data, "Communication_Label", "Has_Unmet_Need", bsw_cols
+)
+print_table(comm_tab, "Table 10. Prevalence by Communication Limitation")
 
 # ---- Part E: Table 1 - Study Sample Description (Estimating Population %) ----
 
-
 cat("\n--- TABLE 1 GENERATION (Descriptive Characteristics) ---\n")
-
-
-
 
 # Run for key demographics
 t1_age <- calc_col_pct(analysis_data, "Age_Group")
 t1_sex <- calc_col_pct(analysis_data, "Sex_Label")
-t1_mob <- calc_col_pct(analysis_data, "Mobility_Label")
-t1_cog <- calc_col_pct(analysis_data, "Cognition_Label") 
+
+# Run for ALL functional limitations
+t1_see  <- calc_col_pct(analysis_data, "Vision_Label")
+t1_hear <- calc_col_pct(analysis_data, "Hearing_Label")
+t1_mob  <- calc_col_pct(analysis_data, "Mobility_Label")
+t1_cog  <- calc_col_pct(analysis_data, "Cognition_Label") 
+t1_care <- calc_col_pct(analysis_data, "SelfCare_Label")
+t1_comm <- calc_col_pct(analysis_data, "Communication_Label")
 
 # Combine all characteristics into the final table
-table1_final <- bind_rows(t1_age, t1_sex, t1_mob, t1_cog) 
+table1_final <- bind_rows(
+  t1_age, t1_sex, 
+  t1_see, t1_hear, t1_mob, t1_cog, t1_care, t1_comm
+) 
 
 print_table(
   table1_final,
   "Table 1. Weighted Sample Characteristics (Descriptive)"
 )
+
 
 
 
